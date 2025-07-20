@@ -8,7 +8,7 @@
 ;;             Rakotomandimby Mihamina <mihamina.rakotomandimby@rktmb.org>
 ;;             Bozhidar Batsov <bozhidar@batsov.dev>
 ;; URL: https://github.com/copilot-emacs/copilot.el
-;; Package-Requires: ((emacs "27.2") (editorconfig "0.8.2") (jsonrpc "1.0.14") (f "0.20.0"))
+;; Package-Requires: ((emacs "27.2") (editorconfig "0.8.2") (f "0.20.0"))
 ;; Version: 0.3.0-snapshot
 ;; Keywords: convenience copilot
 
@@ -41,7 +41,7 @@
 (require 'cl-lib)
 (require 'compile)
 (require 'json)
-(require 'jsonrpc)
+(require 'url-http)
 (require 'subr-x)
 
 (require 'f)
@@ -64,6 +64,24 @@ Disable idle completion if set to nil."
           (const :tag "Idle completion disabled" nil))
   :group 'copilot
   :package-version '(copilot . "0.1"))
+
+(defcustom copilot-api-key nil
+  "API key for 豆包大模型.
+
+This should be set to your 豆包大模型 API key.
+You can set this via `copilot-login' or customize this variable directly."
+  :type '(choice (const :tag "Not set" nil)
+                 (string :tag "API Key"))
+  :group 'copilot
+  :package-version '(copilot . "0.3"))
+
+(defcustom copilot-api-endpoint "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+  "API endpoint for 豆包大模型.
+
+This is the URL used to make completion requests to 豆包大模型."
+  :type 'string
+  :group 'copilot
+  :package-version '(copilot . "0.3"))
 
 (defcustom copilot-network-proxy nil
   "Network proxy to use for Copilot.
@@ -93,6 +111,7 @@ performance."
 
 (defcustom copilot-server-log-level 0
   "Log level of the Copilot server.
+NOTE: This is no longer used with 豆包大模型 API integration.
 0 - no log
 1 - error
 2 - warning
@@ -103,7 +122,8 @@ performance."
   :package-version '(copilot . "0.1"))
 
 (defcustom copilot-server-args '("--stdio")
-  "Additional arguments to pass to the Copilot server."
+  "Additional arguments to pass to the Copilot server.
+NOTE: This is no longer used with 豆包大模型 API integration."
   :group 'copilot
   :type '(repeat string)
   :package-version '(copilot . "0.1"))
@@ -150,28 +170,32 @@ find indentation offset."
   :group 'copilot
   :package-version '(copilot . "0.1"))
 
+;; The following server-related configurations are no longer used
+;; since we now use 豆包大模型 API directly instead of a local server
+
 (defconst copilot-server-package-name "@github/copilot-language-server"
-  "The name of the package to install copilot server.")
+  "The name of the package to install copilot server.
+NOTE: This is no longer used with 豆包大模型 API integration.")
 
 (defcustom copilot-install-dir (expand-file-name
                                 (locate-user-emacs-file (f-join ".cache" "copilot")))
-  "Directory in which the servers will be installed."
+  "Directory in which the servers will be installed.
+NOTE: This is no longer used with 豆包大模型 API integration."
   :risky t
   :type 'directory
   :group 'copilot
   :package-version '(copilot . "0.1"))
 
 (defcustom copilot-server-executable "copilot-language-server"
-  "The executable of copilot server."
+  "The executable of copilot server.
+NOTE: This is no longer used with 豆包大模型 API integration."
   :type 'string
   :group 'copilot
   :package-version '(copilot . "0.1"))
 
 (defcustom copilot-version nil
   "Copilot server version.
-
-The default value is the preferred version and ensures functionality.
-You may adjust this variable at your own risk."
+NOTE: This is no longer used with 豆包大模型 API integration."
   :type '(choice (const :tag "Latest" nil)
                  (string :tag "Specific Version"))
   :group 'copilot
@@ -224,7 +248,8 @@ Exchange the URI with the correct URI of your organization."
   "Overlay used to surround point and make copilot-completion-keymap activate.")
 
 (defvar copilot--connection nil
-  "Copilot server jsonrpc connection instance.")
+  "Connection to 豆包大模型 API.
+This variable tracks whether the API has been initialized.")
 
 (defvar-local copilot--line-bias 1
   "Line bias for Copilot completion.")
@@ -245,7 +270,7 @@ Incremented after each change.")
   (not (= copilot--last-doc-version copilot--doc-version)))
 
 (defvar copilot--opened-buffers nil
-  "List of buffers that have been opened in Copilot.")
+  "List of buffers that have been opened for completion.")
 
 (defmacro copilot--dbind (pattern source &rest body)
   "Destructure SOURCE against plist PATTERN and eval BODY."
@@ -290,106 +315,35 @@ Incremented after each change.")
 (declare-function org-map-entries "ext:org.el")
 
 ;;
-;;; Copilot Server Installation
+;;; 豆包大模型 API integration (replaces server installation)
 ;;
 
 (defun copilot-installed-version ()
-  "Return the version number of currently installed `copilot-server-package-name'."
-  (let ((possible-paths (list
-                         (when (eq system-type 'windows-nt)
-                           (f-join copilot-install-dir "node_modules" copilot-server-package-name "package.json"))
-                         (f-join copilot-install-dir "lib" "node_modules" copilot-server-package-name "package.json")
-                         (f-join copilot-install-dir "lib64" "node_modules" copilot-server-package-name "package.json"))))
-    (seq-some
-     (lambda (path)
-       (when (and path (file-exists-p path))
-         (with-temp-buffer
-           (insert-file-contents path)
-           (save-match-data
-             (when (re-search-forward "\"version\": \"\\([0-9]+\\.[0-9]+\\.[0-9]+\\)\"" nil t)
-               (match-string 1))))))
-     possible-paths)))
-
-(defun copilot-server-executable ()
-  "Return the location of the `copilot-server-executable' file."
-  (cond
-   ((and (file-name-absolute-p copilot-server-executable)
-         (file-exists-p copilot-server-executable))
-    copilot-server-executable)
-   ((executable-find copilot-server-executable t))
-   (t
-    (let ((path (executable-find
-                 (f-join copilot-install-dir
-                       (cond ((eq system-type 'windows-nt) "")
-                             (t "bin"))
-                       copilot-server-executable)
-                 t)))
-      (unless (and path (file-exists-p path))
-        (error "The package %s is not installed.  Unable to find %s"
-               copilot-server-package-name path))
-      path))))
-
-;; XXX: This function is modified from `lsp-mode'; see `lsp-async-start-process'
-;; function for more information.
-(defun copilot-async-start-process (callback error-callback &rest command)
-  "Start async process COMMAND with CALLBACK and ERROR-CALLBACK."
-  (with-current-buffer
-      (compilation-start
-       (mapconcat
-        #'shell-quote-argument
-        (seq-filter (lambda (cmd) cmd) command)
-        " ")
-       t
-       (lambda (&rest _)
-         (generate-new-buffer-name "*copilot-install-server*")))
-    (view-mode +1)
-    (add-hook
-     'compilation-finish-functions
-     (lambda (_buf status)
-       (if (string= "finished\n" status)
-           (when callback
-             (condition-case err
-                 (funcall callback)
-               (error
-                (funcall error-callback (error-message-string err)))))
-         (when error-callback
-           (funcall error-callback (string-trim-right status)))))
-     nil t)))
+  "Return the version of the 豆包大模型 API integration.
+This replaces the server version check since we no longer use a local server."
+  "API-Integration")
 
 ;;;###autoload
 (defun copilot-install-server ()
-  "Interactively install server."
+  "Show message that server installation is no longer needed.
+The plugin now uses 豆包大模型 API directly."
   (interactive)
-  (if-let* ((npm-binary (executable-find "npm")))
-      (progn
-        (make-directory copilot-install-dir 'parents)
-        (copilot-async-start-process
-         nil nil
-         npm-binary
-         "-g" "--prefix" copilot-install-dir
-         "install" (concat copilot-server-package-name
-                           (when copilot-version (format "@%s" copilot-version)))))
-    (copilot--log 'warning "Unable to install %s via `npm' because it is not present" copilot-server-package-name)
-    nil))
+  (message "Server installation is no longer needed. This plugin now uses 豆包大模型 API directly. Please set your API key with M-x copilot-login."))
 
 ;;;###autoload
 (defun copilot-uninstall-server ()
-  "Delete a Copilot server from `copilot-install-dir'."
+  "Show message that server uninstallation is no longer needed."
   (interactive)
-  (unless (file-directory-p copilot-install-dir)
-    (user-error "Couldn't find %s directory" copilot-install-dir))
-  (delete-directory copilot-install-dir 'recursive)
-  (copilot--log 'warning "Server `%s' uninstalled." (file-name-nondirectory (directory-file-name copilot-install-dir))))
+  (message "Server uninstallation is no longer needed. This plugin now uses 豆包大模型 API directly."))
 
 ;;;###autoload
 (defun copilot-reinstall-server ()
-  "Interactively re-install server."
+  "Show message that server reinstallation is no longer needed."
   (interactive)
-  (copilot-uninstall-server)
-  (copilot-install-server))
+  (message "Server reinstallation is no longer needed. This plugin now uses 豆包大模型 API directly."))
 
 ;;
-;; Interaction with Copilot Server
+;; Interaction with 豆包大模型 API
 ;;
 
 (defconst copilot--ignore-response
@@ -397,150 +351,161 @@ Incremented after each change.")
   "Simply ignore the response.")
 
 (defsubst copilot--connection-alivep ()
-  "Non-nil if the `copilot--connection' is alive."
-  (and copilot--connection
-       (zerop (process-exit-status (jsonrpc--process copilot--connection)))))
+  "Non-nil if the API connection is available."
+  (not (null copilot-api-key)))
 
-(defmacro copilot--request (&rest args)
-  "Send a request to the copilot server with ARGS."
-  `(progn
-     (unless (copilot--connection-alivep)
-       (copilot--start-server))
-     (jsonrpc-request copilot--connection ,@args)))
+(defun copilot--http-request (method params success-fn &optional error-fn)
+  "Send HTTP request to 豆包大模型 API.
+METHOD is the API method (like 'getCompletions').
+PARAMS are the request parameters.
+SUCCESS-FN is called with the result on success.
+ERROR-FN is called with error message on failure."
+  (unless copilot-api-key
+    (user-error "API key not set. Please run M-x copilot-login to set your 豆包大模型 API key"))
+  
+  (let* ((url-request-method "POST")
+         (url-request-extra-headers
+          `(("Content-Type" . "application/json")
+            ("Authorization" . ,(format "Bearer %s" copilot-api-key))))
+         (url-request-data
+          (json-encode
+           `((model . "ep-20241219224555-7k4x2")
+             (messages . [((role . "user")
+                          (content . ,(copilot--format-completion-prompt params)))])
+             (stream . :json-false)
+             (max_tokens . 500))))
+         (callback-fn
+          (lambda (status)
+            (let ((error-info (plist-get status :error)))
+              (if error-info
+                  (when error-fn
+                    (funcall error-fn (format "HTTP Error: %s" error-info)))
+                (goto-char (point-min))
+                (re-search-forward "^$" nil t)
+                (let* ((response-body (buffer-substring-no-properties (point) (point-max)))
+                       (json-response (condition-case err
+                                        (json-parse-string response-body :object-type 'alist)
+                                      (json-parse-error
+                                       (when error-fn
+                                         (funcall error-fn (format "JSON Parse Error: %s" err)))
+                                       nil))))
+                  (when json-response
+                    (let ((completion-text (copilot--extract-completion json-response)))
+                      (when completion-text
+                        (funcall success-fn (copilot--format-api-response completion-text params)))))))))))
+    (url-retrieve copilot-api-endpoint callback-fn)))
 
-(defmacro copilot--notify (&rest args)
-  "Send a notification to the copilot server with ARGS."
+(defun copilot--format-completion-prompt (params)
+  "Format the completion prompt for 豆包大模型 API from PARAMS."
+  (let* ((doc (plist-get params :doc))
+         (source (plist-get doc :source))
+         (position (plist-get doc :position))
+         (line (plist-get position :line))
+         (character (plist-get position :character)))
+    (format "Complete this code:\n%s" source)))
+
+(defun copilot--extract-completion (json-response)
+  "Extract completion text from 豆包大模型 API JSON-RESPONSE."
+  (let* ((choices (alist-get 'choices json-response))
+         (first-choice (when (and choices (> (length choices) 0))
+                        (aref choices 0)))
+         (message (when first-choice (alist-get 'message first-choice)))
+         (content (when message (alist-get 'content message))))
+    content))
+
+(defun copilot--format-api-response (completion-text params)
+  "Format the completion text from API into the expected response format.
+COMPLETION-TEXT is the text from 豆包大模型.
+PARAMS are the original request parameters."
+  (let* ((doc (plist-get params :doc))
+         (position (plist-get doc :position))
+         (line (plist-get position :line))
+         (character (plist-get position :character)))
+    `(:completions
+      [(:text ,completion-text
+        :uuid ,(format "douban-%d" (random 1000000))
+        :range (:start (:line ,line :character ,character)
+                :end (:line ,line :character ,character))
+        :docVersion 1)])))
+
+(defmacro copilot--request (method params)
+  "Send a synchronous request to 豆包大模型 API (not used in async context).
+METHOD and PARAMS are request parameters."
+  `(error "Synchronous requests not supported with 豆包大模型 API"))
+
+(defmacro copilot--notify (method params)
+  "Send a notification (no-op for 豆包大模型 API).
+METHOD and PARAMS are notification parameters."
   `(progn
-     (unless (copilot--connection-alivep)
-       (copilot--start-server))
-     (jsonrpc-notify copilot--connection ,@args)))
+     ;; Notifications are not needed for HTTP API
+     nil))
 
 (cl-defmacro copilot--async-request (method params &rest args &key (success-fn #'copilot--ignore-response) &allow-other-keys)
-  "Send an asynchronous request to the copilot server.
-
-Arguments METHOD, PARAMS and ARGS are used in function `jsonrpc-async-request'.
-
-SUCCESS-FN is the CALLBACK."
-  `(progn
-     (unless (copilot--connection-alivep)
-       (copilot--start-server))
-     ;; jsonrpc will use temp buffer for callbacks, so we need to save the current buffer and restore it inside callback
-     (let ((buf (current-buffer)))
-       (jsonrpc-async-request copilot--connection
-                              ,method ,params
-                              :success-fn (lambda (result)
-                                            (if (buffer-live-p buf)
-                                                (with-current-buffer buf
-                                                  (funcall ,success-fn result))))
-                              ,@args))))
-
-(defun copilot--command ()
-  "Return the command-line to start copilot server."
-  (append
-   (list (copilot-server-executable))
-   copilot-server-args))
-
-(defun copilot--make-connection ()
-  "Establish copilot jsonrpc connection."
-  (let ((make-fn (apply-partially
-                  #'make-instance
-                  'jsonrpc-process-connection
-                  :name "copilot"
-                  :request-dispatcher #'copilot--handle-request
-                  :notification-dispatcher #'copilot--handle-notification
-                  :process (make-process :name "copilot server"
-                                         :command (copilot--command)
-                                         :coding 'utf-8-emacs-unix
-                                         :connection-type 'pipe
-                                         :stderr (get-buffer-create "*copilot stderr*")
-                                         :noquery t))))
-    (condition-case nil
-        (funcall make-fn :events-buffer-config `(:size ,copilot-log-max))
-      (invalid-slot-name
-       ;; handle older jsonrpc versions
-       (funcall make-fn :events-buffer-scrollback-size copilot-log-max)))))
+  "Send an asynchronous request to 豆包大模型 API.
+METHOD is the request method.
+PARAMS are the request parameters.
+SUCCESS-FN is the callback function."
+  `(let ((buf (current-buffer)))
+     (cond
+      ((eq ,method 'getCompletions)
+       (copilot--http-request ,method ,params
+                             (lambda (result)
+                               (when (buffer-live-p buf)
+                                 (with-current-buffer buf
+                                   (funcall ,success-fn result))))))
+      ((eq ,method 'getCompletionsCycling)
+       (copilot--http-request 'getCompletions ,params
+                             (lambda (result)
+                               (when (buffer-live-p buf)
+                                 (with-current-buffer buf
+                                   (funcall ,success-fn result))))))
+      (t
+       ;; For other methods that are not critical, just call success with empty result
+       (funcall ,success-fn '())))))
 
 (defun copilot--start-server ()
-  "Start the copilot server process in local."
-  (cond
-   ((not (file-exists-p (copilot-server-executable)))
-    (user-error "Server is not installed, please install via `M-x copilot-install-server`"))
-   (t
-    (let ((installed-version (copilot-installed-version)))
-      (when (and copilot-version (not (equal installed-version copilot-version)))
-        (warn "This package has been tested for Copilot server version %s but version %s has been detected.
-You can change the installed version with `M-x copilot-reinstall-server` or remove this warning by changing the value of `copilot-version'."
-              copilot-version installed-version)))
-    (setq copilot--connection (copilot--make-connection))
-    (copilot--log 'info "Copilot server started.")
-    (copilot--request
-     'initialize
-     `(:processId
-       ,(emacs-pid)
-       :capabilities
-       (:workspace
-        (:workspaceFolders t))
-       :initializationOptions
-       (:editorInfo
-        (:name "Emacs" :version ,emacs-version)
-        :editorPluginInfo
-        (:name "copilot.el" :version ,(or (package-get-version) "unknown"))
-        ,@(when copilot-network-proxy
-            `(:networkProxy ,copilot-network-proxy)))))
-    (copilot--notify 'initialized '())
-    (copilot--notify 'workspace/didChangeConfiguration `(:settings ,copilot-lsp-settings)))))
+  "Initialize 豆包大模型 API connection.
+This replaces the server startup since we use HTTP API."
+  (unless copilot-api-key
+    (user-error "API key not set. Please run M-x copilot-login to set your 豆包大模型 API key"))
+  
+  (setq copilot--connection t)
+  (copilot--log 'info "豆包大模型 API initialized."))
 
 ;;
 ;; login / logout
 ;;
 
 (defun copilot-login ()
-  "Login to Copilot."
+  "Set up 豆包大模型 API key."
   (interactive)
-  (copilot--dbind
-      (status user ((:userCode user-code)) ((:verificationUri verification-uri)))
-      (copilot--request 'signInInitiate '(:dummy "signInInitiate"))
-    (when (string-equal status "AlreadySignedIn")
-      (user-error "Already signed in as %s" user))
-    (if (display-graphic-p)
-        (progn
-          (gui-set-selection 'CLIPBOARD user-code)
-          (read-from-minibuffer (format "Your one-time code %s is copied. Press \
-ENTER to open GitHub in your browser. If your browser does not open \
-automatically, browse to %s." user-code verification-uri))
-          (browse-url verification-uri)
-          (read-from-minibuffer "Press ENTER if you finish authorizing."))
-      (read-from-minibuffer (format "First copy your one-time code: %s. Press ENTER to continue." user-code))
-      (read-from-minibuffer (format "Please open %s in your browser. Press ENTER if you finish authorizing." verification-uri)))
-    (copilot--log 'info "Verifying...")
-    (condition-case err
-        (copilot--request 'signInConfirm (list :userCode user-code))
-      (jsonrpc-error
-       (user-error "Authentication failure: %s" (alist-get 'jsonrpc-error-message (cddr err)))))
-    (copilot--dbind (user) (copilot--request 'checkStatus '(:dummy "checkStatus"))
-      (copilot--log 'info "Authenticated as GitHub user %s." user))))
+  (let ((api-key (read-passwd "Enter your 豆包大模型 API key: ")))
+    (when (string-empty-p api-key)
+      (user-error "API key cannot be empty"))
+    (setq copilot-api-key api-key)
+    (customize-save-variable 'copilot-api-key api-key)
+    (message "豆包大模型 API key has been set successfully")))
 
 (defun copilot-logout ()
-  "Logout from Copilot."
+  "Clear the 豆包大模型 API key."
   (interactive)
-  (copilot--request 'signOut '(:dummy "signOut"))
-  (copilot--log 'warning "Logged out."))
+  (setq copilot-api-key nil)
+  (customize-save-variable 'copilot-api-key nil)
+  (setq copilot--connection nil)
+  (message "豆包大模型 API key has been cleared"))
 
 ;;
 ;; diagnose
 ;;
 
 (defun copilot-diagnose ()
-  "Restart and diagnose copilot."
+  "Restart and diagnose 豆包大模型 API connection."
   (interactive)
-  (when copilot--connection
-    (jsonrpc-shutdown copilot--connection 'kill)
-    (setq copilot--connection nil))
+  (setq copilot--connection nil)
   (setq copilot--opened-buffers nil)
   ;; We are going to send a test request for the current buffer so we have to activate the mode
   ;; if it is not already activated.
-  ;; If it the mode is already active, we have to make sure the current buffer is loaded in the
-  ;; server.
+  ;; If the mode is already active, we have to make sure the current buffer is loaded.
   (if copilot-mode
       (copilot--on-doc-focus (selected-window))
     (copilot-mode))
@@ -553,11 +518,11 @@ automatically, browse to %s." user-code verification-uri))
                                            :languageId "text"
                                            :position (:line 0 :character 0)))
                           :success-fn (lambda (_)
-                                        (copilot--log 'info "Copilot OK."))
+                                        (copilot--log 'info "豆包大模型 API OK."))
                           :error-fn (lambda (err)
                                       (copilot--log 'error "%S" err))
                           :timeout-fn (lambda ()
-                                        (copilot--log 'warning "Copilot server timeout."))))
+                                        (copilot--log 'warning "豆包大模型 API timeout.")))))
 
 ;;
 ;; Auto completion
@@ -783,7 +748,8 @@ Each request METHOD can have only one HANDLER."
   (puthash method handler copilot--request-handlers))
 
 (defun copilot--handle-request (_ method msg)
-  "Handle MSG of type METHOD by calling the appropriate registered handler."
+  "Handle MSG of type METHOD by calling the appropriate registered handler.
+NOTE: This is no longer used with 豆包大模型 API integration."
   (let ((handler (gethash method copilot--request-handlers)))
     (when handler
       (funcall handler msg))))
@@ -797,7 +763,8 @@ Each request METHOD can have only one HANDLER."
     (puthash method (cons handler handlers) copilot--notification-handlers)))
 
 (defun copilot--handle-notification (_ method msg)
-  "Handle MSG of type METHOD by calling all appropriate registered handlers."
+  "Handle MSG of type METHOD by calling all appropriate registered handlers.
+NOTE: This is no longer used with 豆包大模型 API integration."
   (let ((handlers (gethash method copilot--notification-handlers '())))
     (dolist (handler handlers)
       (funcall handler msg))))
